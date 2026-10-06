@@ -1,5 +1,6 @@
 # AI-Powered Personalized Learning System (LearnAI)
 
+[![CI Quality Gates](https://img.shields.io/badge/CI-8%20Quality%20Gates-blue.svg)](.github/workflows/ci.yml)
 [![Backend Tests](https://img.shields.io/badge/pytest-26%20passed-emerald.svg)](backend/tests)
 [![Frontend Tests](https://img.shields.io/badge/vitest-16%20passed-emerald.svg)](frontend/src/test)
 [![E2E Tests](https://img.shields.io/badge/playwright-5%20passed-emerald.svg)](frontend/e2e)

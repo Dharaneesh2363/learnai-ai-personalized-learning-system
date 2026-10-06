@@ -1,17 +1,61 @@
-name: LearnAI CI
+name: LearnAI Quality Gates CI
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, master ]
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  backend-tests:
-    name: Backend Test Suite (Pytest)
+  security-and-secret-scan:
+    name: "Gate 8: Security & Secret Scan"
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify no .env or private credentials are tracked in Git
+        run: |
+          echo "Scanning git-tracked files for forbidden files..."
+          if git ls-files | grep -E '(^|/)\.env($|\..*)' | grep -v '\.env\.example'; then
+            echo "ERROR: Tracked .env file detected in Git repository!"
+            exit 1
+          fi
+          echo "Verified: No .env files are tracked."
+
+      - name: Audit repository for accidental secrets
+        run: |
+          echo "Scanning source code for common secret leaks..."
+          # Check for private keys or live API keys
+          if grep -r -E --exclude-dir={.git,node_modules,.venv} "AIza[0-9A-Za-z-_]{35}|sk-[a-zA-Z0-9]{20,}|-----BEGIN (RSA|OPENSSH|EC) PRIVATE KEY-----" .; then
+            echo "ERROR: Potential hard-coded secret pattern detected!"
+            exit 1
+          fi
+          echo "Verified: No secret patterns detected in codebase."
+
+  backend-quality-gates:
+    name: "Gates 1, 5, 6: Backend Tests, Migrations & Integration"
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: learning_system
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
@@ -19,22 +63,48 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
 
       - name: Install backend dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r backend/requirements.txt
-          pip install pytest pytest-asyncio
 
-      - name: Run Pytest test suite
+      - name: "Gate 5: Database Schema & Alembic Migration Verification"
+        env:
+          DATABASE_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/learning_system
+          JWT_SECRET: ci-testing-jwt-secret-key-at-least-32-characters-long!
+          AI_PROVIDER: mock
+          AI_API_KEY: ci-mock-key
         run: |
-          pytest backend/tests -v
+          cd backend
+          python -m alembic upgrade head
 
-  frontend-tests-and-build:
-    name: Frontend Tests & Production Build
+      - name: Seed demo data into PostgreSQL
+        env:
+          DATABASE_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/learning_system
+          JWT_SECRET: ci-testing-jwt-secret-key-at-least-32-characters-long!
+          AI_PROVIDER: mock
+          AI_API_KEY: ci-mock-key
+        run: |
+          cd backend
+          python scripts/seed_data.py
+
+      - name: "Gates 1 & 6: Run Pytest Unit, Security & Integration Suite (26 Tests)"
+        env:
+          DATABASE_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/learning_system
+          JWT_SECRET: ci-testing-jwt-secret-key-at-least-32-characters-long!
+          AI_PROVIDER: mock
+          AI_API_KEY: ci-mock-key
+        run: |
+          cd backend
+          pytest tests -v
+
+  frontend-quality-gates:
+    name: "Gates 2, 3, 4: Frontend Tests, TypeScript & Production Build"
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Node.js 20
@@ -49,12 +119,114 @@ jobs:
           cd frontend
           npm ci
 
-      - name: Run Vitest unit & component tests
+      - name: "Gate 2: Run Vitest Unit & Component Tests (16 Tests)"
         run: |
           cd frontend
           npm test -- --run
 
-      - name: Verify TypeScript & Vite production build
+      - name: "Gates 3 & 4: TypeScript Validation & Vite Production Build"
         run: |
           cd frontend
           npm run build
+
+  e2e-playwright:
+    name: "Gate 7: Playwright Browser End-to-End Suite (5 Journeys)"
+    needs: [backend-quality-gates, frontend-quality-gates]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: learning_system
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: |
+          cd frontend
+          npm ci
+
+      - name: Install Playwright Chromium with system dependencies
+        run: |
+          cd frontend
+          npx playwright install --with-deps chromium
+
+      - name: Run migrations and seed PostgreSQL
+        env:
+          DATABASE_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/learning_system
+          JWT_SECRET: ci-testing-jwt-secret-key-at-least-32-characters-long!
+          AI_PROVIDER: mock
+          AI_API_KEY: ci-mock-key
+        run: |
+          cd backend
+          python -m alembic upgrade head
+          python scripts/seed_data.py
+
+      - name: Start FastAPI backend in background
+        env:
+          DATABASE_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/learning_system
+          JWT_SECRET: ci-testing-jwt-secret-key-at-least-32-characters-long!
+          AI_PROVIDER: mock
+          AI_API_KEY: ci-mock-key
+        run: |
+          cd backend
+          python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+
+      - name: Wait for Backend service readiness
+        run: |
+          echo "Polling FastAPI /health endpoint..."
+          curl --fail --retry 20 --retry-delay 2 --retry-connrefused http://127.0.0.1:8000/health
+          echo "FastAPI Backend is healthy and ready!"
+
+      - name: Start Vite dev server in background
+        run: |
+          cd frontend
+          npm run dev -- --host 127.0.0.1 --port 5173 &
+
+      - name: Wait for Frontend dev server readiness
+        run: |
+          echo "Polling Vite frontend..."
+          curl --fail --retry 20 --retry-delay 2 --retry-connrefused http://127.0.0.1:5173
+          echo "Vite Frontend is responsive!"
+
+      - name: "Gate 7: Execute Playwright E2E Suite"
+        run: |
+          cd frontend
+          npx playwright test e2e
+
+      - name: Upload Playwright Test Report Artifacts on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/test-results/
+          retention-days: 7

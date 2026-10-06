@@ -17,6 +17,12 @@ from app.models.user import User, UserRole
 @pytest.fixture(scope="session", autouse=True)
 def setup_test_db():
     Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    existing_student = db.query(User).filter(User.email == "student@learnai.dev").first()
+    if not existing_student:
+        from scripts.seed_data import seed_database
+        seed_database()
+    db.close()
     yield
 
 
